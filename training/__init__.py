@@ -5,11 +5,16 @@ from .edge_autoregressive_trainer import EdgeAutoregressiveTrainer
 from .edge_regression_trainer import EdgeRegressionTrainer
 from .node_autoregressive_trainer import NodeAutoregressiveTrainer
 from .node_regression_trainer import NodeRegressionTrainer
+from .cluster_dual_autoregressive_trainer import ClusterDualAutoregressiveTrainer
 
-def trainer_factory(model_name: str, autoregressive: bool, *args, **kwargs) -> BaseTrainer:
+def trainer_factory(model_name: str, autoregressive: bool, cluster = False, *args, **kwargs) -> BaseTrainer:
     if 'NodeEdgeGNN' in model_name:
+        if cluster:
+            return ClusterDualAutoregressiveTrainer(*args, **kwargs)
         if autoregressive:
+            
             return DualAutoregressiveTrainer(*args, **kwargs)
+
         return DualRegressionTrainer(*args, **kwargs)
 
     if model_name in ['EdgeGNNAttn']:
