@@ -6,7 +6,7 @@ import gc
 import random
 import torch.optim as optim # <<< CLUSTER-GCN MODIFICATION >>> (Ensure optim is imported)
 
-from argparse import ArgumentParser, Namespace
+from argparse import ArgumentParser, Namespace, BooleanOptionalAction
 from datetime import datetime
 from torch_geometric.loader import ClusterLoader, DataLoader # <<< CLUSTER-GCN MODIFICATION >>> (Import ClusterLoader)
 from torch_geometric.data import Data # <<< CLUSTER-GCN MODIFICATION >>>
@@ -15,11 +15,13 @@ from data import dataset_factory, FloodEventDataset
 from models import model_factory
 from test import get_test_dataset_config, run_test
 # <<< CLUSTER-GCN MODIFICATION >>> (Import partitioning utils and the cluster trainer)
+print("Attempting to import Cluster-GCN specific components...", flush=True)
 try:
-    from utils.cluster_utils import load_base_graph_structure, partition_graph
-    from training import trainer_factory, ClusterDualAutoregressiveTrainer # Assuming your cluster trainer is here
+    from utils.cluster_utils import load_base_graph_structure, partition_graph, visualize_partitions
+    from training import trainer_factory, ClusterDualAutoregressiveTrainer 
+    print("Cluster-GCN specific components imported successfully.", flush=True)
 except ImportError as e:
-    print(f"Warning: Could not import Cluster-GCN specific components: {e}")
+    print(f"Warning: Could not import Cluster-GCN specific components: {e}", flush=True)
     # Define dummy functions/classes if needed for script to load
     def load_base_graph_structure(*args, **kwargs): raise NotImplementedError("Import failed")
     def partition_graph(*args, **kwargs): raise NotImplementedError("Import failed")
@@ -39,6 +41,9 @@ def parse_args() -> Namespace:
     parser.add_argument("--debug", type=bool, default=False, help='Add debug messages to output')
     # <<< CLUSTER-GCN MODIFICATION >>> (Add arg for enabling cluster GCN)
     parser.add_argument("--use_cluster_gcn", action='store_true', help='Enable Cluster-GCN training strategy')
+    parser.add_argument("--num_clusters", type=int, default=30, help='Number of clusters for Cluster-GCN (if enabled)')
+    parser.add_argument("--clusters_per_batch", type=int, default=5, help='Number of clusters per batch for Cluster-GCN (if enabled)')
+    parser.add_argument("--sliding", action=BooleanOptionalAction, default=False, help='Use sliding window for cluster selection (if enabled). Use --sliding or --no-sliding')
     return parser.parse_args()
 
 # --- load_dataset function remains largely the same, prepares dataset objects ---
@@ -100,9 +105,21 @@ def load_dataset(config: Dict, args: Namespace, logger: Logger, use_cluster_gcn:
             # Validation typically doesn't need num_label_timesteps unless tester uses it
         }
         logger.log(f'Using validation dataset configuration: {val_dataset_config}')
-        # <<< CLUSTER-GCN MODIFICATION >>> (Validation dataset also needs memory mode if using Cluster GCN validation)
+        # <<< CLUSTER-GCN MODIFICATION >>> (Validation dataset storage mode: try configured mode, fallback to disk on OOM)
         val_storage_mode = 'memory' if use_cluster_gcn else dataset_parameters.get('validation_storage_mode', storage_mode)
-        val_dataset = dataset_factory(val_storage_mode, autoregressive=False, **val_dataset_config) # Val dataset usually not AR itself
+        try:
+            val_dataset = dataset_factory(val_storage_mode, autoregressive=False, **val_dataset_config) # Val dataset usually not AR itself
+        except Exception as e:
+            logger.log(f"Warning: Failed to load validation dataset with storage_mode='{val_storage_mode}': {e}")
+            # Fallback to disk-backed loading to avoid memory allocation failures
+            fallback_mode = dataset_parameters.get('validation_storage_mode', 'disk') if not use_cluster_gcn else 'disk'
+            logger.log(f"Attempting to load validation dataset using fallback storage_mode='{fallback_mode}'")
+            try:
+                val_dataset = dataset_factory(fallback_mode, autoregressive=False, **val_dataset_config)
+                logger.log("Loaded validation dataset using fallback disk-backed mode.")
+            except Exception:
+                logger.log(f"Failed to load validation dataset in fallback mode:\n{traceback.format_exc()}")
+                raise
 
     else:
         # No validation split needed
@@ -133,17 +150,90 @@ def load_dataset(config: Dict, args: Namespace, logger: Logger, use_cluster_gcn:
 
 
 # --- run_train function remains largely the same, prepares and calls trainer ---
+# def run_train(model: torch.nn.Module,
+#               model_name: str,
+#               # <<< CLUSTER-GCN MODIFICATION >>> (Accept loader instead of dataset)
+#               train_loader: torch.utils.data.DataLoader, # Accepts ClusterLoader or DataLoader
+#               logger: Logger,
+#               config: Dict,
+#               val_dataset: Optional[FloodEventDataset] = None, # Keep val_dataset for trainer validation logic
+#               stats_dir: Optional[str] = None,
+#               model_dir: Optional[str] = None,
+#               device: str = 'cpu',
+#               use_cluster_gcn: bool = False) -> str: # <<< CLUSTER-GCN MODIFICATION >>>
+#         train_config = config['training_parameters']
+
+#         # Loss function and optimizer
+#         optimizer = torch.optim.Adam(model.parameters(), lr=train_config['learning_rate'], weight_decay=train_config['adam_weight_decay'])
+#         logger.log(f'Using Adam optimizer with learning rate {train_config["learning_rate"]} and weight decay {train_config["adam_weight_decay"]}')
+
+#         base_trainer_params = train_utils.get_trainer_config(model_name, config, logger)
+#         trainer_params = {
+#             'model': model,
+#             'dataloader': train_loader, # <<< CLUSTER-GCN MODIFICATION >>> (Pass the loader)
+#             'val_dataset': val_dataset,
+#             'optimizer': optimizer,
+#             'logger': logger,
+#             'device': device,
+#             **base_trainer_params,
+#         }
+
+#         autoregressive_train_config = train_config.get('autoregressive', {})
+#         autoregressive_enabled = autoregressive_train_config.get('enabled', False)
+
+#         # <<< CLUSTER-GCN MODIFICATION >>> (Select the correct trainer class)
+#         if use_cluster_gcn:
+#             # Ensure the specific trainer class is imported and available
+#             try:
+#                 # Assuming ClusterDualAutoregressiveTrainer exists in training package
+#                 from training import ClusterDualAutoregressiveTrainer
+#                 logger.log("Using ClusterDualAutoregressiveTrainer.")
+#                 trainer = ClusterDualAutoregressiveTrainer(**trainer_params)
+#             except ImportError:
+#                  raise ImportError("ClusterDualAutoregressiveTrainer not found. Make sure it's defined and imported.")
+#             except Exception as e:
+#                  raise RuntimeError(f"Error initializing ClusterDualAutoregressiveTrainer: {e}")
+#         else:
+#              logger.log("Using standard trainer factory.")
+#              trainer = trainer_factory(model_name, autoregressive_enabled, **trainer_params)
+#         # <<< END CLUSTER-GCN MODIFICATION >>>
+
+#         trainer.train() # Call the train method of the selected trainer
+
+#         trainer.print_stats_summary()
+
+#         # Save training stats and model
+#         curr_date_str = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+#         if stats_dir is not None:
+#             if not os.path.exists(stats_dir):
+#                 os.makedirs(stats_dir)
+
+#             saved_metrics_path = os.path.join(stats_dir, f'{model_name}_{curr_date_str}_train_stats.npz')
+#             trainer.save_stats(saved_metrics_path)
+
+#         model_path = f'{model_name}_{curr_date_str}.pt'
+#         if model_dir is not None:
+#             if not os.path.exists(model_dir):
+#                 os.makedirs(model_dir)
+
+#             model_path = os.path.join(model_dir, f'{model_name}_{curr_date_str}.pt')
+#             trainer.save_model(model_path)
+
+#         return model_path
+
 def run_train(model: torch.nn.Module,
               model_name: str,
-              # <<< CLUSTER-GCN MODIFICATION >>> (Accept loader instead of dataset)
-              train_loader: torch.utils.data.DataLoader, # Accepts ClusterLoader or DataLoader
+              train_dataset: FloodEventDataset,
               logger: Logger,
               config: Dict,
-              val_dataset: Optional[FloodEventDataset] = None, # Keep val_dataset for trainer validation logic
+              val_dataset: Optional[FloodEventDataset] = None,
               stats_dir: Optional[str] = None,
               model_dir: Optional[str] = None,
               device: str = 'cpu',
-              use_cluster_gcn: bool = False) -> str: # <<< CLUSTER-GCN MODIFICATION >>>
+              partition_map: Optional[torch.Tensor] = None,
+              use_cluster_gcn: bool = False,
+              clusters_per_batch: Optional[int] = 5,
+              sliding: bool = True) -> str:
         train_config = config['training_parameters']
 
         # Loss function and optimizer
@@ -153,35 +243,25 @@ def run_train(model: torch.nn.Module,
         base_trainer_params = train_utils.get_trainer_config(model_name, config, logger)
         trainer_params = {
             'model': model,
-            'dataloader': train_loader, # <<< CLUSTER-GCN MODIFICATION >>> (Pass the loader)
+            'dataset': train_dataset,
             'val_dataset': val_dataset,
             'optimizer': optimizer,
             'logger': logger,
             'device': device,
             **base_trainer_params,
         }
-
-        autoregressive_train_config = train_config.get('autoregressive', {})
-        autoregressive_enabled = autoregressive_train_config.get('enabled', False)
-
-        # <<< CLUSTER-GCN MODIFICATION >>> (Select the correct trainer class)
+        logger.log(f"Trainer parameters prepared: {trainer_params.keys()}")
         if use_cluster_gcn:
-            # Ensure the specific trainer class is imported and available
-            try:
-                # Assuming ClusterDualAutoregressiveTrainer exists in training package
-                from training import ClusterDualAutoregressiveTrainer
-                logger.log("Using ClusterDualAutoregressiveTrainer.")
-                trainer = ClusterDualAutoregressiveTrainer(**trainer_params)
-            except ImportError:
-                 raise ImportError("ClusterDualAutoregressiveTrainer not found. Make sure it's defined and imported.")
-            except Exception as e:
-                 raise RuntimeError(f"Error initializing ClusterDualAutoregressiveTrainer: {e}")
-        else:
-             logger.log("Using standard trainer factory.")
-             trainer = trainer_factory(model_name, autoregressive_enabled, **trainer_params)
-        # <<< END CLUSTER-GCN MODIFICATION >>>
+            logger.log("Using ClusterDualAutoregressiveTrainer with Cluster-GCN strategy.")
+            cluster_gcn_config = config.get('cluster_gcn_parameters', {})
+            trainer_params['partition_map'] = partition_map
+            trainer_params['clusters_per_batch'] = clusters_per_batch
+            trainer_params['sliding'] = sliding
 
-        trainer.train() # Call the train method of the selected trainer
+        autoregressive_train_config = train_config['autoregressive']
+        autoregressive_enabled = autoregressive_train_config.get('enabled', False)
+        trainer = trainer_factory(model_name, autoregressive_enabled, isCluster=use_cluster_gcn, **trainer_params)
+        trainer.train()
 
         trainer.print_stats_summary()
 
@@ -204,7 +284,9 @@ def run_train(model: torch.nn.Module,
 
         return model_path
 
+
 def main():
+    print("Starting main function...", flush=True)
     args = parse_args()
     config = file_utils.read_yaml_file(args.config)
 
@@ -219,104 +301,39 @@ def main():
             random.seed(args.seed)
             np.random.seed(args.seed)
             torch.manual_seed(args.seed)
-            if torch.cuda.is_available():
-                 torch.cuda.manual_seed_all(args.seed)
+            torch.cuda.manual_seed_all(args.seed)
             logger.log(f'Setting random seed to {args.seed}')
 
-        current_device = torch.cuda.get_device_name(args.device) if args.device == 'cuda' and torch.cuda.is_available() else 'CPU'
+        current_device = torch.cuda.get_device_name(args.device) if args.device != 'cpu' else 'CPU'
         logger.log(f'Using device: {current_device}')
 
-        # <<< CLUSTER-GCN MODIFICATION >>> (Determine if using Cluster GCN early)
+        # Dataset
         use_cluster_gcn = args.use_cluster_gcn
-        if use_cluster_gcn:
-            logger.log("Cluster-GCN training mode enabled.")
-            # Add Cluster-GCN specific configs (can also be moved to config file)
-            cluster_gcn_config = config.get('cluster_gcn_parameters', {}) # Get from config if exists
-            NUM_CLUSTERS = cluster_gcn_config.get('num_clusters', 100) # Default 100
-            BATCH_SIZE_CLUSTERS = cluster_gcn_config.get('clusters_per_batch', 20) # Default 20 clusters per batch
-            logger.log(f"Cluster-GCN Params: Num Clusters={NUM_CLUSTERS}, Clusters per Batch={BATCH_SIZE_CLUSTERS}")
-
-
-        # --- Dataset Loading ---
-        logger.log("Loading dataset...")
         train_dataset, val_dataset = load_dataset(config, args, logger, use_cluster_gcn)
-
-        # --- Cluster-GCN Preprocessing (if enabled) ---
+        logger.log(f"use cluster {use_cluster_gcn}")
+        logger.log(f"cluster sliding mode: {args.sliding}")
+        # Partition graph once before training
+        partition_map = None
         if use_cluster_gcn:
-            logger.log("Performing Cluster-GCN preprocessing...")
-            dataset_parameters = config['dataset_parameters']
-            root_dir = dataset_parameters['root_dir']
-            raw_dir = os.path.join(root_dir, 'raw')
-            nodes_shp = dataset_parameters['nodes_shp_file']
-            edges_shp = dataset_parameters['edges_shp_file']
-            # Find a representative HEC-RAS file for geometry
-            # Using the first one from the training summary list
-            train_summary_path = os.path.join(raw_dir, train_dataset_parameters['dataset_summary_file'])
-            if not os.path.exists(train_summary_path):
-                 # Fallback if split_dataset_events wasn't run or file missing
-                 train_summary_path = os.path.join(raw_dir, dataset_parameters['training']['dataset_summary_file'])
+            logger.log("Performing one-time graph partitioning...")
+            # if not hasattr(train_dataset, 'data'):
+            #     raise TypeError("Cluster-GCN requires InMemoryDataset with .data attribute")
+            
+            from torch_geometric.data import ClusterData
+            #cluster_gcn_config = config.get('cluster_gcn_parameters', {})
+            num_clusters = args.num_clusters
+            constant_values_path = 'data/datasets/processed/constant_values.npz'
+            constant_values = np.load(constant_values_path)
+            edge_index = constant_values['edge_index']  # must be available and match num_nodes
+            edge_index_torch = torch.from_numpy(edge_index).long()
+            
+            static_nodes = constant_values['static_nodes']
+            num_nodes = static_nodes.shape[0]
+            partition_map = partition_graph(edge_index_torch, num_nodes, num_clusters)
+            logger.log(f"Partition complete: {partition_map.shape[0]} nodes assigned to {num_clusters} clusters")
 
-            try:
-                import pandas as pd
-                summary_df = pd.read_csv(train_summary_path)
-                hec_ras_geo_file = summary_df['HECRAS_Filepath'][0] # Use first file's geometry
-            except Exception as e:
-                logger.log(f"Error reading HECRAS_Filepath from {train_summary_path}: {e}. Falling back to config.")
-                # Fallback: Define a default HECRAS geo file in config if needed
-                hec_ras_geo_file = dataset_parameters.get('hecras_geometry_file', 'default_geo.hdf') # Get from config or define default
-
-            # 1. Load static structure
-            logger.log("Loading base graph structure for partitioning...")
-            base_graph_structure: Data = load_base_graph_structure(
-                raw_dir, nodes_shp, edges_shp, hec_ras_geo_file
-            )
-
-            # 2. Partition the graph
-            logger.log("Partitioning graph with METIS...")
-            clustered_structure = partition_graph(base_graph_structure, NUM_CLUSTERS)
-            partition_data = clustered_structure.part
-
-            # 3. Add partition info to the loaded dataset
-            # Ensure the train_dataset is InMemoryDataset type
-            if not hasattr(train_dataset, 'data'):
-                 raise TypeError("Cluster-GCN requires an InMemory dataset with a 'data' attribute.")
-            logger.log("Adding partition information to the loaded dataset...")
-            if train_dataset.data.num_nodes != clustered_structure.num_nodes:
-                raise ValueError(
-                    f"Node count mismatch! Partitioning used {clustered_structure.num_nodes} "
-                    f"but loaded dataset has {train_dataset.data.num_nodes}. "
-                    "Ensure the same base graph is used for partitioning and data loading."
-                )
-            train_dataset.data.part = partition_data
-            logger.log("Partition information added.")
-
-            # 4. Create ClusterLoader
-            logger.log("Setting up ClusterLoader...")
-            train_loader = ClusterLoader(
-                train_dataset.data, # Pass the Data object with 'part' attribute
-                num_workers=0,
-                batch_size=BATCH_SIZE_CLUSTERS,
-                shuffle=True,
-            )
-        else:
-            # --- Standard DataLoader ---
-            logger.log("Setting up standard DataLoader...")
-            # Use batch size from config file
-            batch_size = train_config.get('batch_size', 64) # Default batch size
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size,
-                shuffle=True,
-                num_workers=0 # Adjust as needed
-            )
-        # <<< END CLUSTER-GCN MODIFICATION >>>
-
-
-        # --- Model Initialization ---
-        logger.log("Initializing model...")
+        # Model
         model_params = config['model_parameters'][args.model]
-        # Calculate input sizes dynamically based on the loaded dataset object
-        # Ensure dataset object has these properties after loading
         base_model_params = {
             'static_node_features': train_dataset.num_static_node_features,
             'dynamic_node_features': train_dataset.num_dynamic_node_features,
@@ -329,48 +346,38 @@ def main():
         model = model_factory(args.model, **model_config)
         logger.log(f'Using model: {args.model}')
         logger.log(f'Using model configuration: {model_config}')
-        num_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad) # Get num params
+        num_train_params = model.get_model_size()
         logger.log(f'Number of trainable model parameters: {num_train_params}')
 
         checkpoint_path = train_config.get('checkpoint_path', None)
         if checkpoint_path is not None:
             logger.log(f'Loading model from checkpoint: {checkpoint_path}')
-            try:
-                model.load_state_dict(torch.load(checkpoint_path, map_location=args.device)) # Removed weights_only for broader compatibility
-            except Exception as e:
-                logger.log(f"Error loading checkpoint: {e}. Check compatibility.")
-                # Decide whether to proceed with random weights or exit
+            model.load_state_dict(torch.load(checkpoint_path, weights_only=True, map_location=args.device))
 
-        model.to(args.device) # Ensure model is on the correct device
-
-        # --- Run Training ---
-        logger.log("Starting training run...")
         stats_dir = train_config['stats_dir']
         model_dir = train_config['model_dir']
         model_path = run_train(model=model,
                                model_name=args.model,
-                               # <<< CLUSTER-GCN MODIFICATION >>> (Pass loader)
-                               train_loader=train_loader,
+                               train_dataset=train_dataset,
                                val_dataset=val_dataset,
                                logger=logger,
                                config=config,
                                stats_dir=stats_dir,
                                model_dir=model_dir,
                                device=args.device,
-                               # <<< CLUSTER-GCN MODIFICATION >>> (Pass flag)
-                               use_cluster_gcn=use_cluster_gcn)
+                               partition_map=partition_map,
+                               use_cluster_gcn=use_cluster_gcn,
+                               clusters_per_batch=args.clusters_per_batch,
+                               sliding = args.sliding)
 
         logger.log('================================================')
-        logger.log(f'Training finished. Saved model to: {model_path}')
 
-        # --- Optional Testing ---
         if not args.with_test:
             return
 
         # =================== Testing ===================
-        logger.log(f'\nStarting testing for model: {model_path}')
+        logger.log(f'Starting testing for model: {model_path}')
 
-        # Test dataset setup (remains the same, testing usually done on full graph or specific events)
         dataset_parameters = config['dataset_parameters']
         base_datset_config = {
             'root_dir': dataset_parameters['root_dir'],
@@ -386,28 +393,18 @@ def main():
             'outflow_boundary_nodes': dataset_parameters['outflow_boundary_nodes'],
             'debug': args.debug,
             'logger': logger,
-            'force_reload': False, # Avoid reprocessing test data unless needed
+            'force_reload': True,
         }
         test_dataset_config = get_test_dataset_config(base_datset_config, config)
         logger.log(f'Using test dataset configuration: {test_dataset_config}')
 
         # Clear memory before loading test dataset
-        del train_dataset
-        del val_dataset
-        del train_loader
-        # <<< CLUSTER-GCN MODIFICATION >>> (Clear cluster specific vars if needed)
-        if use_cluster_gcn:
-             del base_graph_structure, clustered_structure, partition_data
+        del dataset
         gc.collect()
-        if args.device == 'cuda': torch.cuda.empty_cache()
 
-        storage_mode = dataset_parameters.get('test_storage_mode', 'disk') # Allow separate test storage mode
-        test_dataset = dataset_factory(storage_mode, autoregressive=False, **test_dataset_config)
-        logger.log(f'Loaded test dataset with {len(test_dataset)} samples')
-
-        # Load the trained model state again for testing
-        # model.load_state_dict(torch.load(model_path, map_location=args.device)) # Reload best model
-        # Or just use the model object directly if run_train returns the trained model state
+        storage_mode = dataset_parameters['storage_mode']
+        dataset = dataset_factory(storage_mode, autoregressive=False, **test_dataset_config)
+        logger.log(f'Loaded test dataset with {len(dataset)} samples')
 
         logger.log(f'Using model checkpoint for {args.model}: {model_path}')
         logger.log(f'Using model configuration: {model_config}')
@@ -416,9 +413,9 @@ def main():
         rollout_start = test_config['rollout_start']
         rollout_timesteps = test_config['rollout_timesteps']
         output_dir = test_config['output_dir']
-        run_test(model=model, # Pass the trained model object
-                 model_path=model_path, # Path for logging purposes
-                 dataset=test_dataset,
+        run_test(model=model,
+                 model_path=model_path,
+                 dataset=dataset,
                  logger=logger,
                  rollout_start=rollout_start,
                  rollout_timesteps=rollout_timesteps,
@@ -427,13 +424,9 @@ def main():
 
         logger.log('================================================')
 
-    except Exception as e:
-        logger.log(f'Unexpected error in main:\n{traceback.format_exc()}') # Log full traceback
+    except Exception:
+        logger.log(f'Unexpected error:\n{traceback.format_exc()}')
 
 
 if __name__ == '__main__':
-    # Ensure imports for data_utils, model, training, etc. work
-    # Add necessary paths if files are in different directories
-    # e.g., sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
     main()
-

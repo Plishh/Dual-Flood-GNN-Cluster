@@ -1,8 +1,9 @@
 import torch
 
+from constants import TEST_LOCAL_MASS_LOSS_NODES
 from torch_geometric.loader import DataLoader
 from utils.validation_stats import ValidationStats
-from utils import train_utils
+from utils import physics_utils
 
 from .base_tester import BaseTester
 
@@ -15,7 +16,6 @@ class NodeAutoregressiveTester(BaseTester):
             self.log(f'Validating on run {event_idx + 1}/{len(self.dataset.hec_ras_run_ids)} with Run ID {run_id}')
 
             validation_stats = ValidationStats(logger=self.logger,
-                                                previous_timesteps=self.dataset.previous_timesteps,
                                                 normalizer=self.dataset.normalizer,
                                                 is_normalized=self.dataset.is_normalized,
                                                 delta_t=self.dataset.timestep_interval)
@@ -49,23 +49,30 @@ class NodeAutoregressiveTester(BaseTester):
                 x = torch.concat([graph.x[:, :self.start_node_target_idx], sliding_window, graph.x[:, self.end_node_target_idx:]], dim=1)
                 edge_index, edge_attr = graph.edge_index, graph.edge_attr
 
-                pred = self.model(x, edge_index, edge_attr)
+                # Model may return (node_pred, edge_pred) for dual models; unpack if so
+                model_out = self.model(x, edge_index, edge_attr)
+                if isinstance(model_out, tuple) or isinstance(model_out, list):
+                    pred_diff = model_out[0]
+                else:
+                    pred_diff = model_out
 
                 # Override boundary conditions in predictions
-                pred[self.boundary_nodes_mask] = graph.y[self.boundary_nodes_mask]
+                if self.boundary_nodes_mask is not None:
+                    mask = torch.from_numpy(self.boundary_nodes_mask).to(graph.y.device).bool()
+                    pred_diff[mask] = graph.y[mask]
 
-                sliding_window = torch.concat((sliding_window[:, 1:], pred), dim=1)
+                prev_node_pred = sliding_window[:, [-1]]
+                pred = prev_node_pred + pred_diff
 
                 # Requires normalized physics-informed loss
                 if self.include_physics_loss:
                     # Requires normalized prediction for physics-informed loss
-                    prev_node_pred = sliding_window[:, [-1]]
-                    prev_edge_pred = train_utils.get_curr_flow_from_edge_features(edge_attr, self.dataset.previous_timesteps)
-                    # Need to overwrite boundary conditions as these are masked
-                    prev_edge_pred = train_utils.overwrite_outflow_boundary(prev_edge_pred, graph)
-                    validation_stats.update_physics_informed_stats_for_timestep(pred, prev_node_pred, prev_edge_pred, graph)
+                    prev_edge_pred = physics_utils.get_curr_flow_from_edge_features(edge_attr, self.dataset.previous_timesteps)
+                    validation_stats.update_physics_informed_stats_for_timestep(pred, prev_node_pred, prev_edge_pred, graph, TEST_LOCAL_MASS_LOSS_NODES)
 
-                label = graph.y
+                sliding_window = torch.concat((sliding_window[:, 1:], pred), dim=1)
+
+                label = graph.x[:, [self.end_node_target_idx-1]] + graph.y
                 if self.dataset.is_normalized:
                     pred = self.dataset.normalizer.denormalize(self.dataset.NODE_TARGET_FEATURE, pred)
                     label = self.dataset.normalizer.denormalize(self.dataset.NODE_TARGET_FEATURE, label)
@@ -75,8 +82,13 @@ class NodeAutoregressiveTester(BaseTester):
                 label = torch.clip(label, min=0)
 
                 # Filter boundary conditions for metric computation
-                pred = pred[self.non_boundary_nodes_mask]
-                label = label[self.non_boundary_nodes_mask]
+                # pred = pred[self.non_boundary_nodes_mask]
+                # label = label[self.non_boundary_nodes_mask]
+
+                if self.non_boundary_nodes_mask is not None:
+                    nb_mask = torch.from_numpy(self.non_boundary_nodes_mask).to(pred.device).bool()
+                    pred = pred[nb_mask]
+                    label = label[nb_mask]
 
                 validation_stats.update_stats_for_timestep(pred.cpu(),
                                                            label.cpu(),

@@ -1,9 +1,11 @@
 import torch
 import numpy as np
 import os
+import random
 from torch_geometric.data import Data
 #from torch_geometric.transforms import Metis
-import metis
+import pymetis
+from torch_geometric.utils import to_undirected
 
 # --- Import data retrieval functions from your provided files ---
 # (Assuming these files are accessible in the Python path, e.g., in a 'data' package)
@@ -134,49 +136,228 @@ def load_base_graph_structure(raw_dir: str, nodes_shp_file: str, edges_shp_file:
     data = Data(x=x_s, edge_index=edge_index, edge_attr=edge_attr)
     data.num_nodes = num_nodes
 
+    # Extract and store node positions for visualization
+    from data.shp_data_retrieval import get_cell_position
+    pos = get_cell_position(nodes_shp_path)
+    data.pos = torch.from_numpy(pos).float()
+
     print(f"Loaded base graph structure with {data.num_nodes} nodes and {data.num_edges} edges.")
     return data
 
 
-def partition_graph(data: Data, num_clusters: int) -> Data:
+# def partition_graph(data: Data, num_clusters: int) -> Data:
+#     """
+#     Partitions the graph into clusters using METIS.
+#     This is the core preprocessing step of Cluster-GCN performed IN MEMORY.
+
+#     Args:
+#         data: The PyG Data object (in memory) containing the graph structure.
+#               Must have 'x', 'edge_index', 'num_nodes'.
+#         num_clusters: The desired number of partitions.
+
+#     Returns:
+#         The same Data object (still in memory) with an added 'part' attribute
+#         mapping nodes to clusters. This 'part' attribute IS NOT SAVED TO DISK by this function.
+#     """
+#     if data.x is None or data.edge_index is None or data.num_nodes is None:
+#         raise ValueError("Input Data object must contain 'x', 'edge_index', and 'num_nodes'.")
+
+#     print(f"Partitioning graph into {num_clusters} clusters using METIS (in memory)...")
+
+#     # METIS partitioning works best if the graph is undirected and contiguous
+#     # Add checks or transformations if necessary, e.g., data = data.coalesce()
+#     # from torch_geometric.utils import to_undirected # Example
+#     # data.edge_index, data.edge_attr = to_undirected(data.edge_index, data.edge_attr, num_nodes=data.num_nodes) # Ensure undirected if needed
+
+#     # The Metis transform adds the 'part' attribute directly TO THE IN-MEMORY data object.
+#     # It does NOT write any new files.
+#     #cluster_transform = Metis(num_partitions=num_clusters, recursive=False)
+#     cluster_transform = metis.part_graph(data, num_clusters)
+#     # Metis might modify the input data object in place, or return a new one (PyG behavior might vary).
+#     # Assign the result back to ensure we have the clustered version.
+#     clustered_data = cluster_transform(data)
+
+#     if not hasattr(clustered_data, 'part'):
+#          raise RuntimeError("METIS transform did not add the 'part' attribute to the data object.")
+#     actual_clusters = clustered_data.part.max().item() + 1
+#     if actual_clusters != num_clusters:
+#         print(f"Warning: METIS produced {actual_clusters} clusters, but {num_clusters} were requested.")
+
+#     print("Graph partitioning complete (in memory). 'part' attribute added to Data object.")
+#     # The returned object contains the cluster assignments in memory.
+#     return clustered_data
+
+# def partition_graph(data: Data, num_clusters: int) -> Data:
+#     """
+#     Partitions the graph into spatial clusters using PyMetis.
+#     """
+#     # METIS requires an undirected graph for balanced partitioning
+#     edge_index = to_undirected(data.edge_index)
+    
+#     # Convert edge_index to an adjacency list format required by pymetis
+#     # adj_list[i] contains all neighbors of node i
+#     adj_list = [[] for _ in range(data.num_nodes)]
+#     edge_index_np = edge_index.cpu().numpy()
+    
+#     for i in range(edge_index_np.shape[1]):
+#         u = edge_index_np[0, i]
+#         v = edge_index_np[1, i]
+#         adj_list[u].append(v)
+
+#     print(f"Partitioning graph into {num_clusters} clusters...")
+#     # pymetis.part_graph returns (cuts, partition_indices)
+#     cuts, parts = pymetis.part_graph(num_clusters, adjacency=adj_list)
+    
+#     # Store the partition info back in the Data object for ClusterLoader
+#     data.part = torch.tensor(parts, dtype=torch.long)
+    
+#     return data
+
+
+import matplotlib.pyplot as plt
+
+def visualize_partitions(data: Data, num_clusters: int, save_path: str = None):
     """
-    Partitions the graph into clusters using METIS.
-    This is the core preprocessing step of Cluster-GCN performed IN MEMORY.
+    Partitions the data and visualizes it in one go.
+    """
+    # 1. Perform the partitioning internally
+    data = partition_graph(data, num_clusters)
+
+    # 2. Extract coordinates and partition IDs
+    # Assumes data.pos contains [x, y] coordinates
+    pos = data.pos.cpu().numpy()
+    parts = data.part.cpu().numpy()
+
+    # 3. Plotting
+    plt.figure(figsize=(12, 10))
+    # 'tab20' or 'prism' are good colormaps for distinct clusters
+    scatter = plt.scatter(pos[:, 0], pos[:, 1], c=parts, cmap='tab20', s=15, alpha=0.8)
+    
+    plt.colorbar(scatter, label='Partition ID')
+    plt.title(f'FloodGNN Mesh Partitioning: {num_clusters} Clusters')
+    plt.xlabel('X Coordinate')
+    plt.ylabel('Y Coordinate')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    
+    plt.show()
+    plt.close()
+
+
+def partition_graph(edge_index, num_nodes, num_clusters):
+    """
+    Generates a spatial partition map using PyMetis. 
+    This is run only ONCE before training starts.
+    """
+    # METIS requires an undirected graph
+    edge_index_undirected = to_undirected(edge_index, num_nodes=num_nodes)
+    
+    # Create adjacency list for PyMetis
+    adj_list = [[] for _ in range(num_nodes)]
+    for u, v in edge_index_undirected.t().tolist():
+        adj_list[u].append(v)
+
+    print(f"Partitioning mesh into {num_clusters} spatial clusters...", flush=True)
+    cuts, parts = pymetis.part_graph(num_clusters, adjacency=adj_list)
+    
+    return torch.tensor(parts, dtype=torch.long)
+
+
+def get_clusters_list(
+    num_clusters: int,
+    clusters_per_batch: int,
+    rng: random.Random | None = None
+) -> list[list[int]]:
+    """
+    Randomly partition all clusters into groups, each used to form a combined subgraph.
 
     Args:
-        data: The PyG Data object (in memory) containing the graph structure.
-              Must have 'x', 'edge_index', 'num_nodes'.
-        num_clusters: The desired number of partitions.
+        num_clusters: Total number of clusters in the partition map.
+        clusters_per_batch: Number of clusters to combine per batch.
+        rng: Optional random.Random instance for reproducibility.
 
     Returns:
-        The same Data object (still in memory) with an added 'part' attribute
-        mapping nodes to clusters. This 'part' attribute IS NOT SAVED TO DISK by this function.
+        List of cluster id groups. Every cluster appears in exactly one group.
     """
-    if data.x is None or data.edge_index is None or data.num_nodes is None:
-        raise ValueError("Input Data object must contain 'x', 'edge_index', and 'num_nodes'.")
+    if num_clusters <= 0 or clusters_per_batch <= 0:
+        return []
 
-    print(f"Partitioning graph into {num_clusters} clusters using METIS (in memory)...")
+    rand = rng if rng is not None else random
+    cluster_ids = list(range(num_clusters))
+    rand.shuffle(cluster_ids)
 
-    # METIS partitioning works best if the graph is undirected and contiguous
-    # Add checks or transformations if necessary, e.g., data = data.coalesce()
-    # from torch_geometric.utils import to_undirected # Example
-    # data.edge_index, data.edge_attr = to_undirected(data.edge_index, data.edge_attr, num_nodes=data.num_nodes) # Ensure undirected if needed
+    groups: list[list[int]] = []
+    for i in range(0, num_clusters, clusters_per_batch):
+        groups.append(cluster_ids[i:i + clusters_per_batch])
 
-    # The Metis transform adds the 'part' attribute directly TO THE IN-MEMORY data object.
-    # It does NOT write any new files.
-    #cluster_transform = Metis(num_partitions=num_clusters, recursive=False)
-    cluster_transform = metis.part_graph(data, num_clusters)
-    # Metis might modify the input data object in place, or return a new one (PyG behavior might vary).
-    # Assign the result back to ensure we have the clustered version.
-    clustered_data = cluster_transform(data)
+    return groups
 
-    if not hasattr(clustered_data, 'part'):
-         raise RuntimeError("METIS transform did not add the 'part' attribute to the data object.")
-    actual_clusters = clustered_data.part.max().item() + 1
-    if actual_clusters != num_clusters:
-        print(f"Warning: METIS produced {actual_clusters} clusters, but {num_clusters} were requested.")
+def get_sliding_window_clusters(
+    num_clusters: int,
+    clusters_per_batch: int
+) -> list[list[int]]:
+    """
+    Generate overlapping cluster groups using a sliding window approach.
 
-    print("Graph partitioning complete (in memory). 'part' attribute added to Data object.")
-    # The returned object contains the cluster assignments in memory.
-    return clustered_data
+    Args:
+        num_clusters: Total number of clusters in the partition map.
+        clusters_per_batch: Number of clusters to combine per batch.
 
+    Returns:
+        List of cluster id groups. Each group overlaps with the previous by (clusters_per_batch - 1).
+    """
+    if num_clusters <= 0 or clusters_per_batch <= 0:
+        return []
+
+    groups: list[list[int]] = []
+    for start in range(0, num_clusters - clusters_per_batch + 1):
+        group = list(range(start, start + clusters_per_batch))
+        groups.append(group)
+
+    return groups
+
+
+def get_centered_neighbor_groups(
+    edge_index: torch.Tensor,
+    part: torch.Tensor,
+    num_clusters: int | None = None
+) -> list[list[int]]:
+    """
+    Build one group per cluster where the group contains the center cluster
+    and every cluster connected to it by at least one edge.
+
+    Args:
+        edge_index: Graph connectivity (2, E) with node indices.
+        part: Cluster assignment per node (num_nodes,).
+        num_clusters: Optional total number of clusters. Inferred from part if None.
+
+    Returns:
+        List of groups, one per center cluster id. Each group covers all
+        clusters adjacent to the center, so all outgoing cluster edges are included.
+    """
+    if edge_index.numel() == 0 or part.numel() == 0:
+        return []
+
+    total_clusters = int(part.max().item() + 1) if num_clusters is None else num_clusters
+    if total_clusters <= 0:
+        return []
+
+    edge_index_undirected = to_undirected(edge_index, num_nodes=part.numel())
+
+    adjacency: list[set[int]] = [set() for _ in range(total_clusters)]
+    
+    for u, v in edge_index_undirected.t().tolist():
+        cu = int(part[u])
+        cv = int(part[v])
+        if cu != cv:
+            adjacency[cu].add(cv)
+            adjacency[cv].add(cu)
+
+    groups: list[list[int]] = []
+    for center in range(total_clusters):
+        neighbors = sorted(adjacency[center])
+        groups.append([center, *neighbors])
+
+    return groups
