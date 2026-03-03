@@ -4,7 +4,7 @@ from data import FloodEventDataset
 from torch.nn import Module
 from torch import Tensor
 from torch.optim import Optimizer
-from torch_geometric.loader import DataLoader
+from torch_geometric.loader import DataLoader, ClusterLoader
 from typing import Callable, Optional
 from utils import Logger, EarlyStopping
 from utils.training_stats import TrainingStats
@@ -23,8 +23,14 @@ class BaseTrainer:
                  early_stopping_patience: Optional[int] = None,
                  val_dataset: Optional[FloodEventDataset] = None,
                  logger: Logger = None,
-                 device: str = 'cpu'):
-        self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+                 device: str = 'cpu',
+                 isCluster: Optional[bool] = False):
+        self.dataset = dataset  # Store reference for metadata access
+        if isCluster:
+            logger.log("Using standard DataLoader (cluster sampling in trainer).")
+            self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        else:
+            self.dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         self.model = model
         self.optimizer = optimizer
         self.loss_func = loss_func

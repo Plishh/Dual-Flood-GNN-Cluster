@@ -19,7 +19,8 @@ class PhysicsInformedTrainer(BaseTrainer):
                  *args,
                  **kwargs):
         super().__init__(*args, **kwargs)
-        ds: FloodEventDataset = self.dataloader.dataset
+        # Prefer the original dataset reference (safe for cluster loaders)
+        ds: FloodEventDataset = getattr(self, 'dataset', None) or self.dataloader.dataset
         self.use_physics_loss = use_global_loss or use_local_loss
         self.use_global_loss = use_global_loss
         self.use_local_loss = use_local_loss

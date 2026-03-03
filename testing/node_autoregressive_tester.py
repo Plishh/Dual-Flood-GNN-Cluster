@@ -49,10 +49,17 @@ class NodeAutoregressiveTester(BaseTester):
                 x = torch.concat([graph.x[:, :self.start_node_target_idx], sliding_window, graph.x[:, self.end_node_target_idx:]], dim=1)
                 edge_index, edge_attr = graph.edge_index, graph.edge_attr
 
-                pred_diff = self.model(x, edge_index, edge_attr)
+                # Model may return (node_pred, edge_pred) for dual models; unpack if so
+                model_out = self.model(x, edge_index, edge_attr)
+                if isinstance(model_out, tuple) or isinstance(model_out, list):
+                    pred_diff = model_out[0]
+                else:
+                    pred_diff = model_out
 
                 # Override boundary conditions in predictions
-                pred_diff[self.boundary_nodes_mask] = graph.y[self.boundary_nodes_mask]
+                if self.boundary_nodes_mask is not None:
+                    mask = torch.from_numpy(self.boundary_nodes_mask).to(graph.y.device).bool()
+                    pred_diff[mask] = graph.y[mask]
 
                 prev_node_pred = sliding_window[:, [-1]]
                 pred = prev_node_pred + pred_diff
@@ -75,8 +82,13 @@ class NodeAutoregressiveTester(BaseTester):
                 label = torch.clip(label, min=0)
 
                 # Filter boundary conditions for metric computation
-                pred = pred[self.non_boundary_nodes_mask]
-                label = label[self.non_boundary_nodes_mask]
+                # pred = pred[self.non_boundary_nodes_mask]
+                # label = label[self.non_boundary_nodes_mask]
+
+                if self.non_boundary_nodes_mask is not None:
+                    nb_mask = torch.from_numpy(self.non_boundary_nodes_mask).to(pred.device).bool()
+                    pred = pred[nb_mask]
+                    label = label[nb_mask]
 
                 validation_stats.update_stats_for_timestep(pred.cpu(),
                                                            label.cpu(),

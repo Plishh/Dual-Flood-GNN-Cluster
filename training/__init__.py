@@ -6,11 +6,16 @@ from .edge_autoregressive_trainer import EdgeAutoregressiveTrainer
 from .edge_regression_trainer import EdgeRegressionTrainer
 from .node_autoregressive_trainer import NodeAutoregressiveTrainer
 from .node_regression_trainer import NodeRegressionTrainer
+from .cluster_dual_autoregressive_trainer import ClusterDualAutoregressiveTrainer
+from .cluster_trainer import ClusterTrainer
 
-def trainer_factory(model_name: str, autoregressive: bool, *args, **kwargs) -> BaseTrainer:
+def trainer_factory(model_name: str, autoregressive: bool, isCluster: bool = False, *args, **kwargs) -> BaseTrainer:
     if model_name in NODE_EDGE_MODELS:
         if autoregressive:
+            if isCluster:
+                return ClusterTrainer(*args, **kwargs)
             return DualAutoregressiveTrainer(*args, **kwargs)
+
         return DualRegressionTrainer(*args, **kwargs)
 
     if model_name in EDGE_MODELS:
